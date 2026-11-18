@@ -1,0 +1,603 @@
+import type { Table } from 'dexie';
+import { db } from './db';
+import type {
+  AppSettings,
+  Envelope,
+  EquationPlacement,
+  Folder,
+  GraphObject,
+  ImagePlacement,
+  Notebook,
+  Page,
+  Stroke,
+  SyncKind,
+  SyncRecord,
+  TableObject,
+  TextBlock,
+} from './types';
+import { PAGE_SIZES } from './types';
+import { newId, now } from '../lib/id';
+
+type AnyEntity = Envelope & Record<string, unknown>;
+type EntityTable = Table<AnyEntity, string>;
+
+function tableFor(kind: SyncKind): EntityTable {
+  switch (kind) {
+    case 'folder':
+      return db.folders as unknown as EntityTable;
+    case 'notebook':
+      return db.notebooks as unknown as EntityTable;
+    case 'page':
+      return db.pages as unknown as EntityTable;
+    case 'stroke':
+      return db.strokes as unknown as EntityTable;
+    case 'text':
+      return db.texts as unknown as EntityTable;
+    case 'image':
+      return db.images as unknown as EntityTable;
+    case 'equation':
+      return db.equations as unknown as EntityTable;
+    case 'graph':
+      return db.graphs as unknown as EntityTable;
+    case 'table':
+      return db.tableObjects as unknown as EntityTable;
+    case 'asset':
+      return db.assets as unknown as EntityTable;
+  }
+}
+
+const DEVICE_KEY = 'deviceId';
+
+export async function getDeviceId(): Promise<string> {
+  const row = await db.syncState.get(DEVICE_KEY);
+  if (row && typeof row.value === 'string') return row.value;
+  const id = newId();
+  await db.syncState.put({ key: DEVICE_KEY, value: id });
+  return id;
+}
+
+const DEFAULT_SETTINGS: AppSettings = {
+  toolbarPosition: null,
+  toolbarCollapsed: false,
+  oneFingerPan: true,
+  twoFingerErase: true,
+  palmRejection: true,
+  scribbleToErase: true,
+  // Off by default: the line you draw is the line you keep. A pencil that rests
+  // for a moment should not come back as a straight line.
+  holdToSnap: false,
+  showPerformanceHud: false,
+  showPageBoundary: true,
+  serverUrl: '',
+  autoSync: true,
+  eraserMode: 'stroke',
+  theme: 'system',
+  recentColors: [],
+  gridSpacing: 36,
+  snapEnabled: false,
+  recognizeShapes: true,
+  lastTool: 'fountain',
+};
+
+export async function getSettings(): Promise<AppSettings> {
+  const row = await db.syncState.get('settings');
+  return { ...DEFAULT_SETTINGS, ...((row?.value as Partial<AppSettings>) ?? {}) };
+}
+
+export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSettings> {
+  const current = await getSettings();
+  const next = { ...current, ...patch };
+  await db.syncState.put({ key: 'settings', value: next });
+  return next;
+}
+
+/** Marks an object as locally dirty so the sync engine pushes it. */
+export async function markOutbox(kind: SyncKind, id: string): Promise<void> {
+  const existing = await db.outbox.where('[kind+id]').equals([kind, id]).count();
+  if (existing === 0) await db.outbox.add({ kind, id });
+}
+
+/**
+ * The same for a burst of rows. Committing a page of ink queues hundreds of
+ * strokes at once, and one indexed lookup per stroke inside the write
+ * transaction is what made a long drawing pause. One read, one bulk add.
+ */
+export async function markOutboxMany(kind: SyncKind, ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const queued = new Set(
+    (await db.outbox.where('kind').equals(kind).toArray()).map((row) => row.id),
+  );
+  const rows = ids.filter((id) => !queued.has(id)).map((id) => ({ kind, id }));
+  if (rows.length > 0) await db.outbox.bulkAdd(rows);
+}
+
+export async function pendingCount(): Promise<number> {
+  return db.outbox.count();
+}
+
+/** The queued changes broken down by record kind, for a legible sync line. */
+export async function pendingByKind(): Promise<Record<string, number>> {
+  const counts: Record<string, number> = {};
+  // Outbox rows hold a kind and an id, never a payload, so reading them all is
+  // cheaper than one query per table.
+  for (const row of await db.outbox.toArray()) {
+    counts[row.kind] = (counts[row.kind] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/** The view a page was last left at, or nothing the first time it is opened. */
+export async function loadViewState(
+  pageId: string,
+): Promise<{ scale: number; cx: number; cy: number } | null> {
+  const row = await db.viewStates.get(pageId);
+  if (!row) return null;
+  return { scale: row.scale, cx: row.cx, cy: row.cy };
+}
+
+export async function saveViewState(
+  pageId: string,
+  view: { scale: number; cx: number; cy: number },
+): Promise<void> {
+  if (!Number.isFinite(view.scale) || !Number.isFinite(view.cx) || !Number.isFinite(view.cy)) return;
+  await db.viewStates.put({ pageId, ...view, updatedAt: now() });
+}
+
+/** Applies local metadata (updatedAt/version) then persists and queues. */
+export async function touch<T extends Envelope>(entity: T): Promise<T> {
+  const next = { ...entity, updatedAt: now(), version: entity.version + 1 };
+  await tableFor(kindOfEntity(entity)).put(next as unknown as AnyEntity);
+  await markOutbox(kindOfEntity(next), next.id);
+  return next;
+}
+
+function kindOfEntity(entity: Envelope): SyncKind {
+  if ('notebookId' in entity) return 'page';
+  if ('pageId' in entity) {
+    if ('points' in entity) return 'stroke';
+    if ('text' in entity) return 'text';
+    if ('latex' in entity) return 'equation';
+    if ('functions' in entity) return 'graph';
+    if ('cells' in entity) return 'table';
+    return 'image';
+  }
+  if ('parentId' in entity) return 'folder';
+  if ('title' in entity) {
+    if ('coverColor' in entity) return 'notebook';
+  }
+  if ('mime' in entity) return 'asset';
+  return 'notebook';
+}
+
+export async function baseEnvelope(): Promise<Envelope> {
+  const t = now();
+  return {
+    id: newId(),
+    createdAt: t,
+    updatedAt: t,
+    version: 1,
+    deviceId: await getDeviceId(),
+    deletedAt: null,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Notebooks and folders                                               */
+/* ------------------------------------------------------------------ */
+
+export async function createNotebook(input: {
+  title?: string;
+  folderId?: string | null;
+  coverColor?: string;
+  template?: Page['template'];
+  size?: Page['size'];
+}): Promise<Notebook> {
+  const env = await baseEnvelope();
+  const notebook: Notebook = {
+    ...env,
+    title: input.title?.trim() || 'Untitled notebook',
+    folderId: input.folderId ?? null,
+    coverColor: input.coverColor ?? '#4a6156',
+    favorite: false,
+    archived: false,
+    sortIndex: now(),
+    lastOpenedAt: null,
+  };
+  await db.notebooks.put(notebook);
+  await markOutbox('notebook', notebook.id);
+  await createPage(notebook.id, {
+    template: input.template ?? 'ruled',
+    size: input.size ?? 'a4',
+    index: 0,
+  });
+  return notebook;
+}
+
+export async function createFolder(name: string, parentId: string | null = null): Promise<Folder> {
+  const env = await baseEnvelope();
+  const folder: Folder = {
+    ...env,
+    name: name.trim() || 'New folder',
+    parentId,
+    color: '#7c766b',
+  };
+  await db.folders.put(folder);
+  await markOutbox('folder', folder.id);
+  return folder;
+}
+
+export async function updateNotebook(id: string, patch: Partial<Notebook>): Promise<void> {
+  const current = await db.notebooks.get(id);
+  if (!current) return;
+  await touch({ ...current, ...patch, id });
+}
+
+export async function updateFolder(id: string, patch: Partial<Folder>): Promise<void> {
+  const current = await db.folders.get(id);
+  if (!current) return;
+  await touch({ ...current, ...patch, id });
+}
+
+export async function createPage(
+  notebookId: string,
+  input: Partial<
+    Pick<Page, 'template' | 'size' | 'index' | 'pdfAssetId' | 'pdfPageIndex' | 'title' | 'gridSpacing'>
+  >,
+): Promise<Page> {
+  const env = await baseEnvelope();
+  const size = input.size ?? 'a4';
+  const dims = PAGE_SIZES[size];
+  let index = input.index;
+  if (index === undefined) {
+    const existing = await db.pages.where('notebookId').equals(notebookId).toArray();
+    index = existing.filter((p) => p.deletedAt === null).length;
+  }
+  const prefs = await getSettings();
+  const page: Page = {
+    ...env,
+    notebookId,
+    index,
+    title: input.title ?? '',
+    template: input.template ?? 'ruled',
+    size,
+    width: dims.width,
+    height: dims.height,
+    pdfAssetId: input.pdfAssetId ?? null,
+    pdfPageIndex: input.pdfPageIndex ?? 0,
+    backgroundTint: null,
+    gridSpacing: input.gridSpacing ?? prefs.gridSpacing ?? 36,
+  };
+  await db.pages.put(page);
+  await markOutbox('page', page.id);
+  await updateNotebook(notebookId, {});
+  return page;
+}
+
+/** Duplicates a page including strokes, text and images. */
+export async function duplicatePage(pageId: string): Promise<Page | null> {
+  const page = await db.pages.get(pageId);
+  if (!page) return null;
+  const siblings = await activePages(page.notebookId);
+  const env = await baseEnvelope();
+  const copy: Page = {
+    ...page,
+    ...env,
+    index: siblings.length,
+    title: page.title ? `${page.title} (copy)` : '',
+  };
+  await db.pages.put(copy);
+  await markOutbox('page', copy.id);
+  const strokes = await db.strokes.where('pageId').equals(pageId).toArray();
+  for (const stroke of strokes) {
+    if (stroke.deletedAt !== null) continue;
+    const sEnv = await baseEnvelope();
+    const clone: Stroke = {
+      ...stroke,
+      ...sEnv,
+      pageId: copy.id,
+      points: stroke.points.map((p) => ({ ...p })),
+    };
+    await db.strokes.put(clone);
+    await markOutbox('stroke', clone.id);
+  }
+  const texts = await db.texts.where('pageId').equals(pageId).toArray();
+  for (const text of texts) {
+    if (text.deletedAt !== null) continue;
+    const tEnv = await baseEnvelope();
+    const clone: TextBlock = { ...text, ...tEnv, pageId: copy.id };
+    await db.texts.put(clone);
+    await markOutbox('text', clone.id);
+  }
+  const images = await db.images.where('pageId').equals(pageId).toArray();
+  for (const image of images) {
+    if (image.deletedAt !== null) continue;
+    const iEnv = await baseEnvelope();
+    const clone: ImagePlacement = { ...image, ...iEnv, pageId: copy.id };
+    await db.images.put(clone);
+    await markOutbox('image', clone.id);
+  }
+  const thumb = await db.thumbnails.get(pageId);
+  await cloneRichToPage(pageId, copy.id);
+  if (thumb) await db.thumbnails.put({ ...thumb, pageId: copy.id, updatedAt: now() });
+  return copy;
+}
+
+export async function duplicateNotebook(notebookId: string): Promise<Notebook | null> {
+  const source = await db.notebooks.get(notebookId);
+  if (!source) return null;
+  const copy = await createNotebook({
+    title: `${source.title} (copy)`,
+    folderId: source.folderId,
+    coverColor: source.coverColor,
+  });
+  const pages = await activePages(notebookId);
+  await db.pages.where('notebookId').equals(copy.id).delete();
+  for (const page of pages) {
+    const env = await baseEnvelope();
+    const newPage: Page = { ...page, ...env, notebookId: copy.id, index: page.index };
+    await db.pages.put(newPage);
+    await markOutbox('page', newPage.id);
+    const strokes = await db.strokes.where('pageId').equals(page.id).toArray();
+    for (const stroke of strokes) {
+      if (stroke.deletedAt !== null) continue;
+      const sEnv = await baseEnvelope();
+      const clone: Stroke = {
+        ...stroke,
+        ...sEnv,
+        pageId: newPage.id,
+        points: stroke.points.map((p) => ({ ...p })),
+      };
+      await db.strokes.put(clone);
+      await markOutbox('stroke', clone.id);
+    }
+    const texts = await db.texts.where('pageId').equals(page.id).toArray();
+    for (const text of texts) {
+      if (text.deletedAt !== null) continue;
+      const tEnv = await baseEnvelope();
+      const clone: TextBlock = { ...text, ...tEnv, pageId: newPage.id };
+      await db.texts.put(clone);
+      await markOutbox('text', clone.id);
+    }
+    const images = await db.images.where('pageId').equals(page.id).toArray();
+    for (const image of images) {
+      if (image.deletedAt !== null) continue;
+      const iEnv = await baseEnvelope();
+      const clone: ImagePlacement = { ...image, ...iEnv, pageId: newPage.id };
+      await db.images.put(clone);
+      await markOutbox('image', clone.id);
+    }
+    await cloneRichToPage(page.id, newPage.id);
+  }
+  return copy;
+}
+
+export async function activePages(notebookId: string): Promise<Page[]> {
+  const pages = await db.pages.where('notebookId').equals(notebookId).toArray();
+  return pages
+    .filter((p) => p.deletedAt === null)
+    .sort((a, b) => a.index - b.index || a.createdAt - b.createdAt);
+}
+
+export async function activeFolders(): Promise<Folder[]> {
+  const all = await db.folders.toArray();
+  return all.filter((f) => f.deletedAt === null);
+}
+
+/* ------------------------------------------------------------------ */
+/* Tombstones and cascades                                             */
+/* ------------------------------------------------------------------ */
+
+export async function softDeleteEntity(
+  kind: SyncKind,
+  id: string,
+  cascade: boolean,
+): Promise<void> {
+  const t = now();
+  const table = tableFor(kind);
+  const entity = await table.get(id);
+  if (!entity) return;
+  await table.put({ ...entity, deletedAt: t, updatedAt: t, version: entity.version + 1 });
+  await markOutbox(kind, id);
+  if (!cascade) return;
+
+  if (kind === 'notebook') {
+    const pages = await db.pages.where('notebookId').equals(id).toArray();
+    for (const page of pages) {
+      if (page.deletedAt !== null) continue;
+      await softDeleteEntity('page', page.id, false);
+    }
+  }
+  if (kind === 'page') {
+    const strokes = await db.strokes.where('pageId').equals(id).toArray();
+    for (const s of strokes) {
+      if (s.deletedAt !== null) continue;
+      await softDeleteEntity('stroke', s.id, false);
+    }
+    const texts = await db.texts.where('pageId').equals(id).toArray();
+    for (const x of texts) {
+      if (x.deletedAt !== null) continue;
+      await softDeleteEntity('text', x.id, false);
+    }
+    const images = await db.images.where('pageId').equals(id).toArray();
+    for (const x of images) {
+      if (x.deletedAt !== null) continue;
+      await softDeleteEntity('image', x.id, false);
+    }
+    const richGroups: { kind: RichKind; rows: AnyEntity[] }[] = [
+      { kind: 'equation', rows: (await db.equations.where('pageId').equals(id).toArray()) as unknown as AnyEntity[] },
+      { kind: 'graph', rows: (await db.graphs.where('pageId').equals(id).toArray()) as unknown as AnyEntity[] },
+      { kind: 'table', rows: (await db.tableObjects.where('pageId').equals(id).toArray()) as unknown as AnyEntity[] },
+    ];
+    for (const group of richGroups) {
+      for (const row of group.rows) {
+        if (row.deletedAt !== null) continue;
+        await softDeleteEntity(group.kind, row.id, false);
+      }
+    }
+    await db.drafts.delete(id);
+    await db.thumbnails.delete(id);
+  }
+  if (kind === 'folder') {
+    const children = await db.folders.where('parentId').equals(id).toArray();
+    for (const child of children) {
+      if (child.deletedAt !== null) continue;
+      await softDeleteEntity('folder', child.id, true);
+    }
+    const notebooks = await db.notebooks.where('folderId').equals(id).toArray();
+    for (const nb of notebooks) {
+      if (nb.deletedAt !== null) continue;
+      await softDeleteEntity('notebook', nb.id, true);
+    }
+  }
+}
+
+export async function deleteNotebook(id: string): Promise<void> {
+  await softDeleteEntity('notebook', id, true);
+}
+
+export async function deletePage(pageId: string): Promise<void> {
+  await softDeleteEntity('page', pageId, true);
+  const page = await db.pages.get(pageId);
+  if (!page) return;
+  const siblings = await activePages(page.notebookId);
+  let index = 0;
+  for (const sibling of siblings) {
+    if (sibling.index !== index) {
+      await touch({ ...sibling, index });
+    }
+    index += 1;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Page content                                                        */
+/* ------------------------------------------------------------------ */
+
+export async function loadPageContent(pageId: string): Promise<{
+  strokes: Stroke[];
+  texts: TextBlock[];
+  images: ImagePlacement[];
+  equations: EquationPlacement[];
+  graphs: GraphObject[];
+  tables: TableObject[];
+}> {
+  const [strokes, texts, images, equations, graphs, tables] = await Promise.all([
+    db.strokes.where('pageId').equals(pageId).toArray(),
+    db.texts.where('pageId').equals(pageId).toArray(),
+    db.images.where('pageId').equals(pageId).toArray(),
+    db.equations.where('pageId').equals(pageId).toArray(),
+    db.graphs.where('pageId').equals(pageId).toArray(),
+    db.tableObjects.where('pageId').equals(pageId).toArray(),
+  ]);
+  return {
+    strokes: strokes
+      .filter((s) => s.deletedAt === null)
+      .sort((a, b) => a.createdAt - b.createdAt),
+    texts: texts.filter((t) => t.deletedAt === null),
+    images: images.filter((i) => i.deletedAt === null),
+    equations: equations.filter((e) => e.deletedAt === null),
+    graphs: graphs.filter((g) => g.deletedAt === null),
+    tables: tables.filter((t) => t.deletedAt === null),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Rich page objects (equations, graphs, tables)                       */
+/* ------------------------------------------------------------------ */
+
+export type RichKind = 'equation' | 'graph' | 'table';
+
+/** Writes a rich object, bumping the version so the change syncs. */
+export async function saveRich<T extends Envelope>(kind: RichKind, entity: T): Promise<T> {
+  const existing = (await tableFor(kind).get(entity.id)) as T | undefined;
+  const next = {
+    ...entity,
+    updatedAt: now(),
+    version: existing ? Math.max(existing.version, entity.version) + 1 : Math.max(1, entity.version),
+  } as T;
+  await tableFor(kind).put(next as unknown as AnyEntity);
+  await markOutbox(kind, next.id);
+  return next;
+}
+
+export async function removeRich(kind: RichKind, id: string): Promise<void> {
+  await softDeleteEntity(kind, id, false);
+}
+
+export async function newRichEnvelope(): Promise<Envelope> {
+  return baseEnvelope();
+}
+
+/** Copies every rich object from one page to another (duplicate page or notebook). */
+async function cloneRichToPage(fromPageId: string, toPageId: string): Promise<void> {
+  const groups: { kind: RichKind; rows: AnyEntity[] }[] = [
+    { kind: 'equation', rows: (await db.equations.where('pageId').equals(fromPageId).toArray()) as unknown as AnyEntity[] },
+    { kind: 'graph', rows: (await db.graphs.where('pageId').equals(fromPageId).toArray()) as unknown as AnyEntity[] },
+    { kind: 'table', rows: (await db.tableObjects.where('pageId').equals(fromPageId).toArray()) as unknown as AnyEntity[] },
+  ];
+  for (const group of groups) {
+    for (const row of group.rows) {
+      if (row.deletedAt !== null) continue;
+      const env = await baseEnvelope();
+      const clone = { ...row, ...env, pageId: toPageId } as AnyEntity;
+      await tableFor(group.kind).put(clone);
+      await markOutbox(group.kind, clone.id);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Sync helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+export async function readEntity(kind: SyncKind, id: string): Promise<AnyEntity | undefined> {
+  return tableFor(kind).get(id);
+}
+
+/**
+ * Records the sync has just written, until the next flush.
+ *
+ * An edit that was still sitting in the page buffer holds the copy the remote
+ * change replaced. Writing it back after a pull — or after a conflict was
+ * resolved — put the old version on top of the newer one, so the resolution
+ * silently came back on the next tick. The buffer asks here before writing.
+ */
+const remoteWrites = new Set<string>();
+
+function remoteKey(kind: string, id: string): string {
+  return `${kind}:${id}`;
+}
+
+export function markRemoteWrite(kind: SyncKind, id: string): void {
+  remoteWrites.add(remoteKey(kind, id));
+}
+
+/**
+ * The ids the sync wrote since the last flush. Consumed once: the refresh that
+ * follows a sync flushes immediately, so a mark never outlives that flush and
+ * cannot swallow an edit made a moment later.
+ */
+export function takeRemoteWrites(): Set<string> {
+  const taken = new Set(remoteWrites);
+  remoteWrites.clear();
+  return taken;
+}
+
+export async function applyRemoteRecord(record: SyncRecord): Promise<void> {
+  markRemoteWrite(record.kind, record.id);
+  await tableFor(record.kind).put(record.data as AnyEntity);
+}
+
+export async function clearOutboxFor(kind: string, id: string): Promise<void> {
+  const entries = await db.outbox.where('[kind+id]').equals([kind, id]).toArray();
+  await db.outbox.bulkDelete(entries.map((e) => e.seq!).filter((n) => n !== undefined));
+}
+
+export async function getSyncState<T>(key: string, fallback: T): Promise<T> {
+  const row = await db.syncState.get(key);
+  return row ? (row.value as T) : fallback;
+}
+
+export async function setSyncState(key: string, value: unknown): Promise<void> {
+  await db.syncState.put({ key, value });
+}

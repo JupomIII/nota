@@ -1,0 +1,142 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  /* Warm neutral palette. Dark mode redefines these tokens only, so every
+     component follows the theme without per-class overrides. */
+  --paper: 250 248 244;
+  --paper-raised: 255 253 250;
+  --paper-sunken: 242 238 231;
+  --ink: 31 29 26;
+  --ink-soft: 74 70 63;
+  --ink-muted: 124 118 107;
+  --ink-faint: 168 161 150;
+  --line: 226 220 240;
+  --line-strong: 211 204 190;
+  --accent: 74 97 86;
+  --accent-soft: 231 237 233;
+  --accent-strong: 54 74 65;
+  --danger: 155 75 63;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  /* The document itself never scrolls: it behaves like an app window and only
+     the inner panes scroll. This also removes the iOS rubber-band bounce. */
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+  --paper: 24 23 21;
+  --paper-raised: 33 31 29;
+  --paper-sunken: 18 17 16;
+  --ink: 238 234 226;
+  --ink-soft: 210 204 194;
+  --ink-muted: 156 150 139;
+  --ink-faint: 116 110 101;
+  --line: 52 50 46;
+  --line-strong: 72 68 62;
+  --accent: 138 173 155;
+  --accent-soft: 38 47 42;
+  --accent-strong: 176 208 189;
+  --danger: 208 128 112;
+}
+
+html {
+  background: rgb(var(--paper));
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  color: rgb(var(--ink));
+  background: rgb(var(--paper));
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-font-smoothing: antialiased;
+  touch-action: manipulation;
+}
+
+/* Only these panes scroll, and their scroll position never leaks to the page. */
+.scroll-pane {
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Application chrome must not be text-selectable; inputs re-enable it. */
+#root {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+input,
+textarea {
+  user-select: text;
+  -webkit-user-select: text;
+  font-size: 16px; /* prevents Safari focus zoom on iPad */
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  touch-action: manipulation;
+}
+
+.canvas-stage {
+  touch-action: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.thin-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: rgb(var(--line-strong));
+  border-radius: 8px;
+}
+.thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.safe-px {
+  padding-left: max(1rem, var(--safe-left));
+  padding-right: max(1rem, var(--safe-right));
+}
+
+.paper-grid {
+  background-image: radial-gradient(circle at 1px 1px, rgba(31, 29, 26, 0.08) 1px, transparent 0);
+  background-size: 18px 18px;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-in {
+  animation: fade-in 140ms ease-out;
+}

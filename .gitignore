@@ -1,0 +1,46 @@
+# dependencies
+node_modules/
+frontend/node_modules/
+backend/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# build output
+frontend/dist/
+frontend/dev-dist/
+frontend/lab/sync/dist/
+frontend/lab-dev.log
+*.tsbuildinfo
+
+# local user data — never commit notes, tokens or certificates
+backend/storage/
+backend/storage/certs/
+*.db
+*.db-wal
+*.db-shm
+pairing-token.txt
+pair-secret
+pair-code.txt
+*.pem
+*.key
+*.cer
+.env
+.dev.vars
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# local verification artifacts (screenshots from a manual iPad run)
+/screenshots/
+/shots/
+/spike/
+docs/SPIKE-*.md
+frontend/lab/
+
+# tooling markers
+.freebuff/

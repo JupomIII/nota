@@ -1,0 +1,171 @@
+import type {
+  EquationPlacement,
+  GraphObject,
+  ImagePlacement,
+  Page,
+  Stroke,
+  TableObject,
+  TextBlock,
+} from '../storage/types';
+import { drawPaper } from './paper';
+import { drawStroke } from './strokeRender';
+import { paintText } from './textRender';
+import { boundsOfPoints } from '../lib/geometry';
+import { drawEquationObject, drawTableObject, equationBoxHeight, tableSize } from '../rich/richRender';
+import { drawGraphObject } from '../graph/plot';
+
+export interface RenderPageInput {
+  page: Page;
+  strokes: Stroke[];
+  texts: TextBlock[];
+  images: ImagePlacement[];
+  equations?: EquationPlacement[];
+  graphs?: GraphObject[];
+  tables?: TableObject[];
+  assetBitmaps: Map<string, CanvasImageSource>;
+  pdfCanvas: CanvasImageSource | null;
+  /** Output pixels per document pixel. */
+  scale: number;
+  background: boolean;
+  tint: string | null;
+  showBoundary: boolean;
+  /**
+   * Draw ink as centre-line caps instead of perfect-freehand outlines. At
+   * thumbnail size the two are indistinguishable and the outline pass over a
+   * full page costs far more than the rest of the render.
+   */
+  cheapStrokes?: boolean;
+}
+
+export interface RenderedPage {
+  canvas: HTMLCanvasElement;
+  width: number;
+  height: number;
+  /** Document-space origin of the rendered canvas (non-zero for infinite pages). */
+  originX: number;
+  originY: number;
+}
+
+function contentBounds(input: RenderPageInput): { x: number; y: number; width: number; height: number } {
+  const points: { x: number; y: number }[] = [];
+  for (const stroke of input.strokes) points.push(...stroke.points);
+  for (const text of input.texts) {
+    points.push({ x: text.x, y: text.y }, { x: text.x + text.width, y: text.y + text.fontSize * 2 });
+  }
+  for (const image of input.images) {
+    points.push({ x: image.x, y: image.y }, { x: image.x + image.width, y: image.y + image.height });
+  }
+  for (const equation of input.equations ?? []) {
+    points.push({ x: equation.x, y: equation.y }, { x: equation.x + equation.width, y: equation.y + equationBoxHeight(equation) });
+  }
+  for (const graph of input.graphs ?? []) {
+    points.push({ x: graph.x, y: graph.y }, { x: graph.x + graph.width, y: graph.y + graph.height });
+  }
+  for (const table of input.tables ?? []) {
+    const size = tableSize(table);
+    points.push({ x: table.x, y: table.y }, { x: table.x + size.width, y: table.y + size.height });
+  }
+  if (points.length === 0) return { x: 0, y: 0, width: 1240, height: 1754 };
+  const bounds = boundsOfPoints(points, 48);
+  return {
+    x: Math.max(0, bounds.minX),
+    y: Math.max(0, bounds.minY),
+    width: Math.max(200, bounds.maxX - bounds.minX),
+    height: Math.max(200, bounds.maxY - bounds.minY),
+  };
+}
+
+/** Centre-line ink for thumbnails: same colour and weight, no outline build. */
+function drawStrokeCheap(ctx: CanvasRenderingContext2D, stroke: Stroke): void {
+  const points = stroke.points;
+  if (points.length === 0) return;
+  const width = Math.max(0.75, stroke.width);
+  ctx.save();
+  ctx.globalAlpha = stroke.opacity;
+  ctx.fillStyle = stroke.color;
+  ctx.strokeStyle = stroke.color;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = width;
+  if (points.length === 1) {
+    ctx.beginPath();
+    ctx.arc(points[0]!.x, points[0]!.y, width / 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    return;
+  }
+  ctx.beginPath();
+  ctx.moveTo(points[0]!.x, points[0]!.y);
+  for (let i = 1; i < points.length - 1; i++) {
+    const a = points[i]!;
+    const b = points[i + 1]!;
+    ctx.quadraticCurveTo(a.x, a.y, (a.x + b.x) / 2, (a.y + b.y) / 2);
+  }
+  const last = points[points.length - 1]!;
+  ctx.lineTo(last.x, last.y);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/** Renders a page off-screen for PNG/PDF export and thumbnails. */
+export function renderPage(input: RenderPageInput): RenderedPage {
+  const infinite = input.page.size === 'infinite';
+  const bounds = infinite
+    ? contentBounds(input)
+    : { x: 0, y: 0, width: input.page.width, height: input.page.height };
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bounds.width * input.scale));
+  canvas.height = Math.max(1, Math.round(bounds.height * input.scale));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas 2D is not available');
+
+  ctx.setTransform(input.scale, 0, 0, input.scale, 0, 0);
+  ctx.translate(-bounds.x, -bounds.y);
+
+  if (input.background) {
+    drawPaper(ctx, {
+      template: input.page.template,
+      width: bounds.width,
+      height: bounds.height,
+      scale: input.scale,
+      tint: input.tint,
+      infinite: false,
+      showBoundary: input.showBoundary && !infinite,
+      gridSpacing: input.page.gridSpacing,
+    });
+    if (input.pdfCanvas) {
+      ctx.drawImage(input.pdfCanvas, bounds.x, bounds.y, bounds.width, bounds.height);
+    }
+  }
+
+  for (const stroke of input.strokes) {
+    if (input.cheapStrokes && !stroke.shape) drawStrokeCheap(ctx, stroke);
+    else drawStroke(ctx, stroke);
+  }
+  for (const image of input.images) {
+    const bitmap = input.assetBitmaps.get(image.assetId);
+    if (bitmap) ctx.drawImage(bitmap, image.x, image.y, image.width, image.height);
+  }
+  for (const table of input.tables ?? []) drawTableObject(ctx, table);
+  for (const graph of input.graphs ?? []) drawGraphObject(ctx, graph, input.scale);
+  for (const equation of input.equations ?? []) drawEquationObject(ctx, equation);
+  for (const text of input.texts) paintText(ctx, text);
+
+  return {
+    canvas,
+    width: canvas.width,
+    height: canvas.height,
+    originX: bounds.x,
+    originY: bounds.y,
+  };
+}
+
+export async function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error('PNG encoding failed'));
+    }, 'image/png');
+  });
+}
